@@ -75,7 +75,7 @@ Bridge Service (TypeScript) ← → GenLayer (Python oracles)
 - OpenZeppelin 5.x for ReentrancyGuard, Ownable, ERC20
 - BetCOFI states: ACTIVE → RESOLVING → RESOLVED/UNDETERMINED
 - Resolution types: CRYPTO (0), STOCKS (1), NEWS (2)
-- 7-day timeout allows bet cancellation if oracle fails
+- 7-day timeout allows anyone to cancel a bet for refunds if resolution never completes (oracle never replied, or `resolve()` was never called)
 
 ## Environment Variables
 
