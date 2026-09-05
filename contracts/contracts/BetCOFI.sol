@@ -206,11 +206,20 @@ contract BetCOFI is ReentrancyGuard, Ownable {
         emit WinningsClaimed(msg.sender, payout);
     }
 
-    /// @notice Creator can cancel if oracle doesn't respond within RESOLUTION_TIMEOUT
+    /// @notice Refund path for a market whose resolution never completed. Callable by anyone
+    /// once the timeout for the current state has elapsed: ACTIVE means resolve() was never
+    /// requested, RESOLVING means the oracle never replied. Both settle to UNDETERMINED, which
+    /// lets every bettor reclaim their stake via claim().
     function cancelBet() external {
-        require(msg.sender == creator, "Only creator can cancel");
-        require(status == BetStatus.RESOLVING, "Can only cancel while resolving");
-        require(block.timestamp >= resolutionRequestedAt + RESOLUTION_TIMEOUT, "Timeout not reached");
+        uint256 deadline;
+        if (status == BetStatus.ACTIVE) {
+            deadline = endDate + RESOLUTION_TIMEOUT;
+        } else if (status == BetStatus.RESOLVING) {
+            deadline = resolutionRequestedAt + RESOLUTION_TIMEOUT;
+        } else {
+            revert("Bet already finalized");
+        }
+        require(block.timestamp >= deadline, "Timeout not reached");
 
         uint8 oldStatus = uint8(status);
         isResolved = true;

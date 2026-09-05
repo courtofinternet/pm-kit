@@ -20,6 +20,8 @@ describe("BetCOFI", function () {
   const RESOLUTION_CRITERIA = "Based on CoinMarketCap price";
   const SIDE_A = "Yes";
   const SIDE_B = "No";
+  // Mirrors BetCOFI.RESOLUTION_TIMEOUT (private constant, not readable from tests)
+  const RESOLUTION_TIMEOUT = 7 * 24 * 60 * 60;
 
   // Helper to create a bet through the factory
   async function createBet(endDateOffset: number = 7 * 24 * 60 * 60): Promise<string> {
@@ -513,6 +515,11 @@ describe("BetCOFI", function () {
       await expect(
         bet.connect(creator).cancelBet()
       ).to.be.revertedWith("Timeout not reached");
+
+      // The timeout guard must hold for third parties too, not only the creator
+      await expect(
+        bet.connect(bettor2).cancelBet()
+      ).to.be.revertedWith("Timeout not reached");
     });
 
     it("Should allow creator to cancel after RESOLUTION_TIMEOUT (7 days)", async function () {
@@ -526,12 +533,16 @@ describe("BetCOFI", function () {
       expect(await bet.isResolved()).to.be.true;
     });
 
-    it("Should only allow creator to cancel", async function () {
+    it("Should allow ANY address to cancel a RESOLVING market after the timeout", async function () {
       await time.increase(7 * 24 * 60 * 60 + 1);
 
-      await expect(
-        bet.connect(bettor1).cancelBet()
-      ).to.be.revertedWith("Only creator can cancel");
+      // bettor1 is neither the creator nor the factory
+      expect(await bet.creator()).to.not.equal(bettor1.address);
+      await expect(bet.connect(bettor1).cancelBet())
+        .to.emit(bet, "BetUndetermined");
+
+      expect(await bet.status()).to.equal(3); // UNDETERMINED
+      expect(await bet.isResolved()).to.be.true;
     });
 
     it("Should allow refunds after cancellation", async function () {
@@ -543,6 +554,126 @@ describe("BetCOFI", function () {
       const balanceAfter = await usdc.balanceOf(bettor1.address);
 
       expect(balanceAfter - balanceBefore).to.equal(USDC_AMOUNT(100));
+    });
+  });
+
+  describe("Cancellation Timeout - ACTIVE market where resolve() was never called", function () {
+    beforeEach(async function () {
+      // Bettor1: 200 on A, Bettor2: 100 on B. resolve() is deliberately NEVER called.
+      await usdc.connect(bettor1).approve(await factory.getAddress(), USDC_AMOUNT(200));
+      await usdc.connect(bettor2).approve(await factory.getAddress(), USDC_AMOUNT(100));
+      await factory.connect(bettor1).placeBet(await bet.getAddress(), true, USDC_AMOUNT(200));
+      await factory.connect(bettor2).placeBet(await bet.getAddress(), false, USDC_AMOUNT(100));
+    });
+
+    it("Should not allow cancel while betting is still live", async function () {
+      // Still before endDate - the market is live and must not be cancellable by anyone
+      for (const signer of [creator, bettor1, bettor3]) {
+        await expect(bet.connect(signer).cancelBet()).to.be.revertedWith("Timeout not reached");
+      }
+      expect(await bet.status()).to.equal(0); // ACTIVE
+    });
+
+    it("Should not allow cancel between endDate and endDate + RESOLUTION_TIMEOUT", async function () {
+      const endDate = await bet.endDate();
+
+      await time.increaseTo(endDate + 1n);
+      await expect(bet.connect(bettor1).cancelBet()).to.be.revertedWith("Timeout not reached");
+
+      // One second short of the deadline
+      await time.increaseTo(endDate + BigInt(RESOLUTION_TIMEOUT) - 2n);
+      await expect(bet.connect(bettor1).cancelBet()).to.be.revertedWith("Timeout not reached");
+
+      expect(await bet.status()).to.equal(0); // still ACTIVE
+    });
+
+    it("Should allow ANY address to cancel at exactly endDate + RESOLUTION_TIMEOUT", async function () {
+      const endDate = await bet.endDate();
+      const deadline = endDate + BigInt(RESOLUTION_TIMEOUT);
+
+      // bettor3 placed no bet on this market and is not the creator
+      expect(await bet.creator()).to.not.equal(bettor3.address);
+      await time.setNextBlockTimestamp(deadline);
+      const receipt = await (await bet.connect(bettor3).cancelBet()).wait();
+
+      // Prove the cancellation landed on the exact boundary, not after it
+      const block = await ethers.provider.getBlock(receipt!.blockNumber);
+      expect(block!.timestamp).to.equal(Number(deadline));
+
+      expect(await bet.status()).to.equal(3); // UNDETERMINED
+      expect(await bet.isResolved()).to.be.true;
+    });
+
+    it("Should emit BetUndetermined when an ACTIVE market is cancelled", async function () {
+      const endDate = await bet.endDate();
+      await time.increaseTo(endDate + BigInt(RESOLUTION_TIMEOUT));
+
+      await expect(bet.connect(bettor3).cancelBet()).to.emit(bet, "BetUndetermined");
+    });
+
+    it("Should refund every bettor in full after an ACTIVE market is cancelled", async function () {
+      const endDate = await bet.endDate();
+      await time.increaseTo(endDate + BigInt(RESOLUTION_TIMEOUT));
+      await bet.connect(bettor3).cancelBet();
+
+      const before1 = await usdc.balanceOf(bettor1.address);
+      const before2 = await usdc.balanceOf(bettor2.address);
+
+      await bet.connect(bettor1).claim();
+      await bet.connect(bettor2).claim();
+
+      expect((await usdc.balanceOf(bettor1.address)) - before1).to.equal(USDC_AMOUNT(200));
+      expect((await usdc.balanceOf(bettor2.address)) - before2).to.equal(USDC_AMOUNT(100));
+      // The whole pot has been returned - nothing is stranded
+      expect(await usdc.balanceOf(await bet.getAddress())).to.equal(0);
+    });
+
+    it("Should not allow resolve() after an ACTIVE market has been cancelled", async function () {
+      const endDate = await bet.endDate();
+      await time.increaseTo(endDate + BigInt(RESOLUTION_TIMEOUT));
+      await bet.connect(bettor3).cancelBet();
+
+      await expect(bet.connect(creator).resolve()).to.be.revertedWith("Bet not active");
+    });
+  });
+
+  describe("Cancellation of finalized markets", function () {
+    beforeEach(async function () {
+      await usdc.connect(bettor1).approve(await factory.getAddress(), USDC_AMOUNT(200));
+      await usdc.connect(bettor2).approve(await factory.getAddress(), USDC_AMOUNT(100));
+      await factory.connect(bettor1).placeBet(await bet.getAddress(), true, USDC_AMOUNT(200));
+      await factory.connect(bettor2).placeBet(await bet.getAddress(), false, USDC_AMOUNT(100));
+    });
+
+    it("Should not allow cancelling a RESOLVED market", async function () {
+      const endDate = await bet.endDate();
+      await time.increaseTo(endDate + 1n);
+      await bet.connect(creator).resolve();
+      await simulateBridgeResolution(await bet.getAddress(), true, false);
+      expect(await bet.status()).to.equal(2); // RESOLVED
+
+      await time.increase(RESOLUTION_TIMEOUT * 2);
+      for (const signer of [creator, bettor1, bettor3]) {
+        await expect(bet.connect(signer).cancelBet()).to.be.revertedWith("Bet already finalized");
+      }
+      expect(await bet.status()).to.equal(2); // unchanged
+      expect(await bet.isSideAWinner()).to.be.true; // outcome preserved
+    });
+
+    it("Should not allow cancelling an UNDETERMINED market a second time", async function () {
+      const endDate = await bet.endDate();
+      await time.increaseTo(endDate + BigInt(RESOLUTION_TIMEOUT));
+      await bet.connect(bettor3).cancelBet();
+      expect(await bet.status()).to.equal(3); // UNDETERMINED
+
+      const undeterminedBefore = await factory.getUndeterminedBetsCount();
+      await time.increase(RESOLUTION_TIMEOUT * 2);
+
+      for (const signer of [creator, bettor3]) {
+        await expect(bet.connect(signer).cancelBet()).to.be.revertedWith("Bet already finalized");
+      }
+      // No duplicate notifyStatusChange reached the factory
+      expect(await factory.getUndeterminedBetsCount()).to.equal(undeterminedBefore);
     });
   });
 

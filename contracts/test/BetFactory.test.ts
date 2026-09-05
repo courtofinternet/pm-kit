@@ -430,5 +430,55 @@ describe("BetFactoryCOFI", function () {
       const resolvingBets = await factory.getBetsByStatus(1); // RESOLVING
       expect(resolvingBets.length).to.equal(0);
     });
+
+    it("Should keep status arrays correct for ACTIVE -> UNDETERMINED cancellations", async function () {
+      const RESOLUTION_TIMEOUT = 7 * 24 * 60 * 60;
+      const endDate = (await time.latest()) + 1000;
+
+      // Three markets so that cancelling the first one exercises the swap-and-pop branch
+      const addresses: string[] = [];
+      for (const name of ["Bet 1", "Bet 2", "Bet 3"]) {
+        const receipt = await (
+          await factory.createBet(name, "Desc", "Yes", "No", endDate, 0, "0x")
+        ).wait();
+        const event = receipt?.logs.find((log) => {
+          try {
+            return factory.interface.parseLog(log as any)?.name === "BetCreated";
+          } catch {
+            return false;
+          }
+        });
+        addresses.push(factory.interface.parseLog(event as any)?.args[0]);
+      }
+      const [b1, b2, b3] = addresses;
+      expect(await factory.getActiveBets()).to.deep.equal([b1, b2, b3]);
+
+      await time.increaseTo(endDate + RESOLUTION_TIMEOUT);
+
+      // bettor is not the creator of any of these markets (deployer is)
+      const bet1 = (await ethers.getContractAt("BetCOFI", b1)) as BetCOFI;
+      await expect(bet1.connect(bettor).cancelBet())
+        .to.emit(factory, "BetStatusChanged")
+        .withArgs(b1, 0, 3); // ACTIVE -> UNDETERMINED
+
+      // b3 was swapped into b1's slot, so ordering is [b3, b2]
+      expect(await factory.getActiveBets()).to.deep.equal([b3, b2]);
+      expect(await factory.getActiveBetsCount()).to.equal(2);
+      expect(await factory.getUndeterminedBets()).to.deep.equal([b1]);
+      expect(await factory.getBetsByStatus(3)).to.deep.equal([b1]);
+
+      // Cancel the swapped-in market to prove its stored index was rewritten correctly
+      const bet3 = (await ethers.getContractAt("BetCOFI", b3)) as BetCOFI;
+      await bet3.connect(bettor).cancelBet();
+      expect(await factory.getActiveBets()).to.deep.equal([b2]);
+      expect(await factory.getUndeterminedBets()).to.deep.equal([b1, b3]);
+
+      const bet2 = (await ethers.getContractAt("BetCOFI", b2)) as BetCOFI;
+      await bet2.connect(bettor).cancelBet();
+      expect(await factory.getActiveBets()).to.deep.equal([]);
+      expect(await factory.getUndeterminedBets()).to.deep.equal([b1, b3, b2]);
+      expect(await factory.getResolvingBetsCount()).to.equal(0);
+      expect(await factory.getResolvedBetsCount()).to.equal(0);
+    });
   });
 });
